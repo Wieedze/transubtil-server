@@ -1,43 +1,46 @@
-import { Client } from 'basic-ftp';
+import SftpClient from 'ssh2-sftp-client';
 import path from 'path';
-import { Readable } from 'stream';
+
 export class O2SwitchStorage {
     constructor() {
         this.connected = false;
         this.connecting = null;
-        this.client = new Client();
-        this.client.ftp.verbose = false; // Set to true for debugging
+        this.client = new SftpClient();
     }
+
     static getInstance() {
         if (!O2SwitchStorage.instance) {
             O2SwitchStorage.instance = new O2SwitchStorage();
         }
         return O2SwitchStorage.instance;
     }
+
     async connect() {
         if (this.connected) {
-            console.log('♻️ Reusing existing FTP connection');
+            console.log('♻️ Reusing existing SFTP connection');
             return;
         }
         if (this.connecting) {
-            console.log('⏳ Waiting for ongoing FTP connection...');
+            console.log('⏳ Waiting for ongoing SFTP connection...');
             await this.connecting;
             return;
         }
         this.connecting = (async () => {
             try {
-                await this.client.access({
+                await this.client.connect({
                     host: process.env.O2SWITCH_SFTP_HOST,
-                    port: parseInt(process.env.O2SWITCH_FTP_PORT || '21'),
-                    user: process.env.O2SWITCH_SFTP_USER,
+                    port: parseInt(process.env.O2SWITCH_SFTP_PORT || '22'),
+                    username: process.env.O2SWITCH_SFTP_USER,
                     password: process.env.O2SWITCH_SFTP_PASSWORD,
-                    secure: true, // Enable FTPS (FTP over TLS)
-                    secureOptions: {
-                        rejectUnauthorized: false, // Accept self-signed certificates
-                    },
+                    readyTimeout: 60000,
+                    retries: 3,
+                    retry_factor: 2,
+                    retry_minTimeout: 2000,
+                    keepaliveInterval: 10000,
+                    keepaliveCountMax: 3,
                 });
                 this.connected = true;
-                console.log('✅ FTPS connection established');
+                console.log('✅ SFTP connection established');
             }
             catch (error) {
                 this.connected = false;
@@ -49,6 +52,7 @@ export class O2SwitchStorage {
         })();
         await this.connecting;
     }
+
     async uploadFile(buffer, filename, type) {
         let remotePath;
         let publicUrl = null;
@@ -60,31 +64,28 @@ export class O2SwitchStorage {
             remotePath = path.join(process.env.O2SWITCH_BASE_PATH, type, filename);
             publicUrl = `${process.env.O2SWITCH_PUBLIC_URL}/${type}/${filename}`;
         }
-        // Ensure directory exists
-        const dir = path.dirname(remotePath);
-        await this.client.ensureDir(dir);
-        // Upload from buffer using a readable stream
-        const readable = Readable.from(buffer);
-        await this.client.uploadFrom(readable, remotePath);
+        await this.client.put(buffer, remotePath);
         return publicUrl || remotePath;
     }
+
     async disconnect() {
         if (this.connected) {
-            this.client.close();
+            await this.client.end();
             this.connected = false;
-            console.log('🔌 FTP connection closed');
+            console.log('🔌 SFTP connection closed');
         }
     }
+
     async fileExists(filename, type) {
         try {
             const remotePath = path.join(process.env.O2SWITCH_BASE_PATH, type, filename);
-            const size = await this.client.size(remotePath);
-            return size >= 0;
+            return await this.client.exists(remotePath) !== false;
         }
         catch {
             return false;
         }
     }
+
     // Admin-specific methods
     async listAdminFiles(relativePath = '/') {
         const adminBasePath = process.env.ADMIN_STORAGE_PATH || '/home/faji2535/admin-files';
@@ -93,49 +94,44 @@ export class O2SwitchStorage {
         return list
             .filter((item) => item.name !== '.' && item.name !== '..')
             .map((item) => ({
-            basename: item.name,
-            filename: path.join(relativePath, item.name),
-            type: item.isDirectory ? 'directory' : 'file',
-            size: item.size,
-            lastmod: item.modifiedAt ? item.modifiedAt.toISOString() : new Date().toISOString(),
-            mime: item.isDirectory ? undefined : 'application/octet-stream',
-        }));
+                basename: item.name,
+                filename: path.join(relativePath, item.name),
+                type: item.type === 'd' ? 'directory' : 'file',
+                size: item.size,
+                lastmod: new Date(item.modifyTime).toISOString(),
+                mime: item.type === 'd' ? undefined : 'application/octet-stream',
+            }));
     }
+
     async downloadAdminFile(relativePath) {
         const adminBasePath = process.env.ADMIN_STORAGE_PATH || '/home/faji2535/admin-files';
         const fullPath = path.join(adminBasePath, relativePath);
-        const chunks = [];
-        const writable = new (await import('stream')).Writable({
-            write(chunk, _encoding, callback) {
-                chunks.push(Buffer.from(chunk));
-                callback();
-            },
-        });
-        await this.client.downloadTo(writable, fullPath);
-        return Buffer.concat(chunks);
+        return await this.client.get(fullPath);
     }
+
     async deleteAdminFile(relativePath) {
         const adminBasePath = process.env.ADMIN_STORAGE_PATH || '/home/faji2535/admin-files';
         const fullPath = path.join(adminBasePath, relativePath);
-        try {
-            // Try to remove as file first
-            await this.client.remove(fullPath);
-        }
-        catch {
-            // If it fails, try as directory
-            await this.client.removeDir(fullPath);
+        const stat = await this.client.stat(fullPath);
+        if (stat.isDirectory) {
+            await this.client.rmdir(fullPath, true);
+        } else {
+            await this.client.delete(fullPath);
         }
     }
+
     async createAdminDirectory(relativePath) {
         const adminBasePath = process.env.ADMIN_STORAGE_PATH || '/home/faji2535/admin-files';
         const fullPath = path.join(adminBasePath, relativePath);
-        await this.client.ensureDir(fullPath);
+        await this.client.mkdir(fullPath, true);
     }
+
     async searchAdminFiles(relativePath, query) {
         const adminBasePath = process.env.ADMIN_STORAGE_PATH || '/home/faji2535/admin-files';
         const fullPath = path.join(adminBasePath, relativePath);
         const searchResults = [];
         const lowerQuery = query.toLowerCase();
+
         const searchDirectory = async (dirPath) => {
             const list = await this.client.list(dirPath);
             for (const item of list) {
@@ -147,17 +143,19 @@ export class O2SwitchStorage {
                     searchResults.push({
                         name: item.name,
                         size: item.size,
-                        type: item.isDirectory ? 'd' : '-',
+                        type: item.type === 'd' ? 'd' : '-',
                         path: relPath,
                     });
                 }
-                if (item.isDirectory) {
+                if (item.type === 'd') {
                     await searchDirectory(itemPath);
                 }
             }
         };
+
         await searchDirectory(fullPath);
         return searchResults;
     }
 }
+
 O2SwitchStorage.instance = null;
